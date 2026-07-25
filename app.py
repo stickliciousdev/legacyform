@@ -680,6 +680,44 @@ with tab_browse:
                     )
                     st.success(f"Updated EVT-{int(fix_id):04d}.")
 
+        with st.expander("Delete an event (trial / mistake)", expanded=False):
+            st.caption(
+                "Permanently removes the event and any staff shifts linked to it."
+            )
+            del_id = st.selectbox(
+                "Event to delete",
+                options=list(events_view["id"]),
+                format_func=lambda eid: event_label(
+                    events_view[events_view["id"] == eid].iloc[0]
+                ),
+                key="delete_event_id",
+            )
+            shift_count = fetch_df(
+                "select count(*) as n from staff_shifts where event_id = :id",
+                {"id": int(del_id)},
+            ).iloc[0]["n"]
+            st.warning(
+                f"This will delete **EVT-{int(del_id):04d}**"
+                + (f" and **{int(shift_count)}** staff shift(s)." if int(shift_count) else ".")
+            )
+            confirm = st.checkbox(
+                f"I understand — permanently delete EVT-{int(del_id):04d}",
+                key="delete_event_confirm",
+            )
+            if st.button(
+                "Delete event",
+                type="primary",
+                disabled=not confirm,
+                use_container_width=True,
+                key="delete_event_btn",
+            ):
+                run_write("delete from events where id = :id", {"id": int(del_id)})
+                if st.session_state.last_event_id == int(del_id):
+                    st.session_state.last_event_id = None
+                    st.session_state.shifts_saved_for_event = 0
+                st.success(f"Deleted EVT-{int(del_id):04d}.")
+                st.rerun()
+
     st.caption("Staff shifts")
     shifts_view = fetch_df(
         "select * from staff_shifts_view "
