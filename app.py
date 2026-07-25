@@ -16,6 +16,9 @@ from sqlalchemy import text
 st.set_page_config(page_title="Event & Staff Tracker", page_icon="🚚", layout="wide")
 
 SETUP_OPTIONS = ["Food Truck", "Tent", "Ice Cream Van"]
+DATE_FMT = "DD/MM/YYYY"  # Streamlit date_input display
+DATE_PY = "%d/%m/%Y"
+DATETIME_PY = "%d/%m/%Y %H:%M"
 
 # Tighten vertical spacing for faster scanning / less scrolling
 st.markdown(
@@ -66,15 +69,109 @@ def strip_tz_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def format_date_au(value) -> str:
+    """Display a date/datetime as day/month/year."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value.strftime(DATETIME_PY)
+    if isinstance(value, date):
+        return value.strftime(DATE_PY)
+    # string fallback
+    try:
+        parsed = pd.to_datetime(value)
+        if pd.isna(parsed):
+            return str(value)
+        if getattr(parsed, "hour", 0) or getattr(parsed, "minute", 0):
+            return parsed.strftime(DATETIME_PY)
+        return parsed.strftime(DATE_PY)
+    except Exception:
+        return str(value)
+
+
+def format_df_dates_au(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy a dataframe with date/datetime columns shown as DD/MM/YYYY for tables."""
+    out = df.copy()
+    for col in out.columns:
+        series = out[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            # distinguish date-only vs datetime by checking if all times are midnight
+            times = series.dropna()
+            if times.empty:
+                continue
+            if (times.dt.normalize() == times).all():
+                out[col] = series.dt.strftime(DATE_PY)
+            else:
+                out[col] = series.dt.strftime(DATETIME_PY)
+        elif series.dtype == object:
+            # Postgres date sometimes arrives as Python date objects
+            sample = series.dropna().head(1)
+            if not sample.empty and isinstance(sample.iloc[0], (date, datetime)):
+                out[col] = series.map(format_date_au)
+    return out
+
+
 def combine_dt(d: date, t: dtime) -> datetime:
     return datetime.combine(d, t)
+
+
+def money(v) -> float:
+    """Treat empty number inputs as 0."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return 0.0
+    return float(v)
+
+
+def allocate_sales_categories(eftpos, cash, food, drinks, other):
+    """
+    Eftpos/cash are the payment total.
+    If only food OR only drinks is entered, fill the other with the remainder
+    (after subtracting Other if provided). No hard match validation.
+    """
+    eft = money(eftpos)
+    csh = money(cash)
+    total = round(eft + csh, 2)
+    other_v = money(other) if other is not None else None
+    food_v = food
+    drinks_v = drinks
+    note = None
+
+    other_amt = money(other_v) if other_v is not None else 0.0
+
+    if total > 0:
+        if food_v is None and drinks_v is not None:
+            food_v = max(round(total - money(drinks_v) - other_amt, 2), 0.0)
+            note = f"Auto-filled Food ${food_v:.2f} (remaining after Drinks/Other)."
+        elif drinks_v is None and food_v is not None:
+            drinks_v = max(round(total - money(food_v) - other_amt, 2), 0.0)
+            note = f"Auto-filled Drinks ${drinks_v:.2f} (remaining after Food/Other)."
+        elif food_v is None and drinks_v is None:
+            # Neither food nor drinks entered — put remainder into Food if Other set,
+            # otherwise leave categories at 0 (user may only have payment totals).
+            if other_v is not None:
+                food_v = max(round(total - other_amt, 2), 0.0)
+                drinks_v = 0.0
+                note = f"Auto-filled Food ${food_v:.2f} (remaining after Other)."
+            else:
+                food_v, drinks_v, other_v = 0.0, 0.0, 0.0
+
+    return (
+        eft,
+        csh,
+        money(food_v),
+        money(drinks_v),
+        money(other_v) if other_v is not None else 0.0,
+        note,
+    )
 
 
 def event_label(row) -> str:
     eid = int(row["id"])
     venue = row.get("venue") or "?"
     ed = row.get("event_date") or row.get("start_at") or ""
-    return f"EVT-{eid:04d} — {venue} ({ed})"
+    return f"EVT-{eid:04d} — {venue} ({format_date_au(ed)})"
 
 
 def load_events_for_picker() -> pd.DataFrame:
@@ -112,6 +209,12 @@ tab_event, tab_roster, tab_browse, tab_export = st.tabs(
 with tab_event:
     defaults = st.session_state.last_event_defaults or {}
 
+    # Clear identity fields on the run after a successful save (before widgets exist)
+    if st.session_state.pop("clear_evt_identity", False):
+        st.session_state.evt_venue = ""
+        st.session_state.evt_location = ""
+        st.session_state.evt_contact = ""
+
     head_l, head_r = st.columns([3, 1])
     with head_l:
         st.caption("Fill top → bottom from the paper form. Submit clears for the next one.")
@@ -121,49 +224,98 @@ with tab_event:
         if not st.session_state.last_event_defaults:
             st.warning("Nothing to copy yet — submit one event first.")
         else:
+            d = st.session_state.last_event_defaults
+            st.session_state.evt_venue = d.get("venue", "")
+            st.session_state.evt_location = d.get("location", "")
+            st.session_state.evt_contact = d.get("contact_info", "")
+            st.session_state.evt_start_d = d.get("start_d", date.today())
+            st.session_state.evt_end_d = d.get(
+                "end_d", st.session_state.evt_start_d
+            )
+            st.session_state.evt_prev_start_d = st.session_state.evt_start_d
+            st.session_state.evt_start_t = d.get("start_t", dtime(9, 0))
+            st.session_state.evt_end_t = d.get("end_t", dtime(17, 0))
+            st.session_state.evt_rent = float(d.get("rent", 0.0))
             st.toast("Previous defaults loaded")
 
+    # Identity + dates sit outside the form so end date can follow start live
+    if "evt_venue" not in st.session_state:
+        st.session_state.evt_venue = defaults.get("venue", "")
+    if "evt_location" not in st.session_state:
+        st.session_state.evt_location = defaults.get("location", "")
+    if "evt_contact" not in st.session_state:
+        st.session_state.evt_contact = defaults.get("contact_info", "")
+    if "evt_start_d" not in st.session_state:
+        st.session_state.evt_start_d = defaults.get("start_d", date.today())
+    if "evt_end_d" not in st.session_state:
+        st.session_state.evt_end_d = defaults.get(
+            "end_d", st.session_state.evt_start_d
+        )
+    if "evt_prev_start_d" not in st.session_state:
+        st.session_state.evt_prev_start_d = st.session_state.evt_start_d
+    if "evt_start_t" not in st.session_state:
+        st.session_state.evt_start_t = defaults.get("start_t", dtime(9, 0))
+    if "evt_end_t" not in st.session_state:
+        st.session_state.evt_end_t = defaults.get("end_t", dtime(17, 0))
+    if "evt_rent" not in st.session_state:
+        st.session_state.evt_rent = float(defaults.get("rent", 0.0))
+
+    # If start date changed and end was still matching the old start, keep them in sync
+    if st.session_state.evt_start_d != st.session_state.evt_prev_start_d:
+        if st.session_state.evt_end_d == st.session_state.evt_prev_start_d:
+            st.session_state.evt_end_d = st.session_state.evt_start_d
+        st.session_state.evt_prev_start_d = st.session_state.evt_start_d
+
+    v1, v2, v3 = st.columns([2, 2, 1.4])
+    with v1:
+        venue = st.text_input(
+            "Event name *",
+            key="evt_venue",
+            placeholder="e.g. Marayong Public School fete",
+            help="Show / event name — what you call this booking.",
+        )
+    with v2:
+        location = st.text_input(
+            "Address",
+            key="evt_location",
+            placeholder="Paste full address from Google Maps",
+            help="Full street address — paste from Google so it can plot on a map later.",
+        )
+    with v3:
+        contact_info = st.text_input(
+            "Contact",
+            key="evt_contact",
+            placeholder="Name / phone",
+        )
+
+    t1, t2, t3, t4, t5 = st.columns([1.1, 1, 1.1, 1, 1])
+    with t1:
+        start_d = st.date_input(
+            "Start date *",
+            key="evt_start_d",
+            format=DATE_FMT,
+        )
+    with t2:
+        start_t = st.time_input("Start *", key="evt_start_t")
+    with t3:
+        end_d = st.date_input(
+            "End date *",
+            key="evt_end_d",
+            format=DATE_FMT,
+            help="Matches start date until you change it (multi-day / past midnight).",
+        )
+    with t4:
+        end_t = st.time_input("End *", key="evt_end_t")
+    with t5:
+        rent = st.number_input(
+            "Rent $",
+            min_value=0.0,
+            step=1.0,
+            format="%.2f",
+            key="evt_rent",
+        )
+
     with st.form("event_form", clear_on_submit=True, border=False):
-        # Venue row
-        v1, v2, v3 = st.columns([2, 2, 1.4])
-        with v1:
-            venue = st.text_input(
-                "Show / venue *",
-                value=defaults.get("venue", ""),
-                placeholder="Marayong Public School",
-            )
-        with v2:
-            location = st.text_input(
-                "Location / address",
-                value=defaults.get("location", ""),
-                placeholder="Suburb / street",
-            )
-        with v3:
-            contact_info = st.text_input(
-                "Contact",
-                value=defaults.get("contact_info", ""),
-                placeholder="Name / phone",
-            )
-
-        # When + rent
-        t1, t2, t3, t4, t5 = st.columns([1.1, 1, 1.1, 1, 1])
-        with t1:
-            start_d = st.date_input("Start date *", value=defaults.get("start_d", date.today()))
-        with t2:
-            start_t = st.time_input("Start *", value=defaults.get("start_t", dtime(9, 0)))
-        with t3:
-            end_d = st.date_input("End date *", value=defaults.get("end_d", date.today()))
-        with t4:
-            end_t = st.time_input("End *", value=defaults.get("end_t", dtime(17, 0)))
-        with t5:
-            rent = st.number_input(
-                "Rent $",
-                min_value=0.0,
-                step=1.0,
-                format="%.2f",
-                value=float(defaults.get("rent", 0.0)),
-            )
-
         # Setup + utilities
         s1, s2 = st.columns([2.2, 1.2])
         with s1:
@@ -221,19 +373,56 @@ with tab_event:
             placeholder="Who / what they sold",
         )
 
-        # Sales — one tight row
-        st.caption("Sales (Food + Drinks + Other must match Eftpos + Cash)")
+        # Sales — empty until typed (avoids 0.00 sticking in front of digits)
+        st.caption(
+            "Sales — leave Food or Drinks blank to auto-fill the other from Eftpos+Cash"
+        )
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
-            eftpos = st.number_input("Eftpos $ *", min_value=0.0, step=1.0, format="%.2f")
+            eftpos = st.number_input(
+                "Eftpos $",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=None,
+                placeholder="0.00",
+            )
         with m2:
-            cash = st.number_input("Cash $ *", min_value=0.0, step=1.0, format="%.2f")
+            cash = st.number_input(
+                "Cash $",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=None,
+                placeholder="0.00",
+            )
         with m3:
-            food = st.number_input("Food $", min_value=0.0, step=1.0, format="%.2f")
+            food = st.number_input(
+                "Food $",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=None,
+                placeholder="auto / type",
+            )
         with m4:
-            drinks = st.number_input("Drinks $", min_value=0.0, step=1.0, format="%.2f")
+            drinks = st.number_input(
+                "Drinks $",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=None,
+                placeholder="auto / type",
+            )
         with m5:
-            other_sales = st.number_input("Other $", min_value=0.0, step=1.0, format="%.2f")
+            other_sales = st.number_input(
+                "Other $",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                value=None,
+                placeholder="0.00",
+            )
 
         n1, n2 = st.columns([1, 2])
         with n1:
@@ -250,25 +439,24 @@ with tab_event:
         end_at = combine_dt(end_d, end_t)
         errors = []
         if not venue.strip():
-            errors.append("Venue is required.")
+            errors.append("Event name is required.")
         if not setup_types and not setup_other.strip():
             errors.append("Select at least one setup type (or describe under Setup other).")
         if end_at <= start_at:
             errors.append("End must be after start.")
         if competition_present == "Yes" and int(competition_count) < 1:
             errors.append("Competition is Yes — enter how many (≥ 1).")
-        total = round(eftpos + cash, 2)
-        category_total = round(food + drinks + other_sales, 2)
-        if total > 0 and abs(total - category_total) > 0.01:
-            errors.append(
-                f"Food+Drinks+Other (${category_total:.2f}) must match "
-                f"Eftpos+Cash (${total:.2f})."
-            )
+
+        eftpos, cash, food, drinks, other_sales, sales_note = allocate_sales_categories(
+            eftpos, cash, food, drinks, other_sales
+        )
 
         if errors:
             for e in errors:
                 st.error(e)
         else:
+            if sales_note:
+                st.info(sales_note)
             extra_bits = []
             if location.strip():
                 extra_bits.append(f"Location: {location.strip()}")
@@ -342,9 +530,16 @@ with tab_event:
                 "competition_notes": competition_notes,
                 "weather": weather.strip(),
             }
-            st.success(
+            # Clear identity for next form; keep dates/times for same-day batching
+            st.session_state.clear_evt_identity = True
+            st.session_state.flash_event_saved = (
                 f"Saved EVT-{new_id:04d}. Add staff below, then start the next form."
             )
+            st.rerun()
+
+    flash = st.session_state.pop("flash_event_saved", None)
+    if flash:
+        st.success(flash)
 
     # ── Staff for this event (same tab) ─────────────────────────────────────
     st.markdown("##### Staff on this event")
@@ -439,6 +634,7 @@ with tab_event:
                     shift_start_d = st.date_input(
                         "Start date *",
                         value=dflt.get("start_d", date.today()),
+                        format=DATE_FMT,
                         key="inline_shift_start_d",
                     )
                 with c2:
@@ -450,8 +646,10 @@ with tab_event:
                 with c3:
                     shift_end_d = st.date_input(
                         "End date *",
-                        value=dflt.get("end_d", date.today()),
+                        value=dflt.get("end_d", dflt.get("start_d", date.today())),
+                        format=DATE_FMT,
                         key="inline_shift_end_d",
+                        help="Defaults to the event start/end; change only if needed.",
                     )
                 with c4:
                     shift_end_t = st.time_input(
@@ -573,7 +771,7 @@ with tab_browse:
         limit 500
         """
     )
-    st.dataframe(events_view, use_container_width=True, hide_index=True, height=260)
+    st.dataframe(events_view.pipe(format_df_dates_au), use_container_width=True, hide_index=True, height=260)
 
     if not events_view.empty:
         with st.expander("Fix an event", expanded=False):
@@ -646,39 +844,31 @@ with tab_browse:
                 )
 
             if fix_submit:
-                total = round(f_eftpos + f_cash, 2)
-                cats = round(f_food + f_drinks + f_other, 2)
-                if total > 0 and abs(total - cats) > 0.01:
-                    st.error(
-                        f"Food+Drinks+Other (${cats:.2f}) must match "
-                        f"Eftpos+Cash (${total:.2f})."
-                    )
-                else:
-                    run_write(
-                        """
-                        update events set
-                            venue = :venue, rent = :rent,
-                            eftpos = :eftpos, cash = :cash, food = :food,
-                            drinks = :drinks, other_sales = :other_sales,
-                            notes = :notes, square_note = :square_note,
-                            weather_summary = :weather_summary
-                        where id = :id
-                        """,
-                        {
-                            "id": int(fix_id),
-                            "venue": f_venue.strip(),
-                            "rent": f_rent,
-                            "eftpos": f_eftpos,
-                            "cash": f_cash,
-                            "food": f_food,
-                            "drinks": f_drinks,
-                            "other_sales": f_other,
-                            "notes": f_notes.strip(),
-                            "square_note": f_square.strip(),
-                            "weather_summary": f_weather.strip(),
-                        },
-                    )
-                    st.success(f"Updated EVT-{int(fix_id):04d}.")
+                run_write(
+                    """
+                    update events set
+                        venue = :venue, rent = :rent,
+                        eftpos = :eftpos, cash = :cash, food = :food,
+                        drinks = :drinks, other_sales = :other_sales,
+                        notes = :notes, square_note = :square_note,
+                        weather_summary = :weather_summary
+                    where id = :id
+                    """,
+                    {
+                        "id": int(fix_id),
+                        "venue": f_venue.strip(),
+                        "rent": f_rent,
+                        "eftpos": f_eftpos,
+                        "cash": f_cash,
+                        "food": f_food,
+                        "drinks": f_drinks,
+                        "other_sales": f_other,
+                        "notes": f_notes.strip(),
+                        "square_note": f_square.strip(),
+                        "weather_summary": f_weather.strip(),
+                    },
+                )
+                st.success(f"Updated EVT-{int(fix_id):04d}.")
 
         with st.expander("Delete an event (trial / mistake)", expanded=False):
             st.caption(
@@ -723,7 +913,12 @@ with tab_browse:
         "select * from staff_shifts_view "
         "order by event_date desc nulls last, id desc limit 500"
     )
-    st.dataframe(shifts_view, use_container_width=True, hide_index=True, height=220)
+    st.dataframe(
+        shifts_view.pipe(format_df_dates_au),
+        use_container_width=True,
+        hide_index=True,
+        height=220,
+    )
 
 # === TAB 5 — Export ===========================================================
 with tab_export:
@@ -741,6 +936,8 @@ with tab_export:
         )
         events_export = strip_tz_for_excel(events_export)
         shifts_export = strip_tz_for_excel(shifts_export)
+        events_export = format_df_dates_au(events_export)
+        shifts_export = format_df_dates_au(shifts_export)
 
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
