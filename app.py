@@ -117,6 +117,27 @@ def combine_dt(d: date, t: dtime) -> datetime:
     return datetime.combine(d, t)
 
 
+def as_date(value, fallback: date | None = None) -> date:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return fallback or date.today()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return pd.to_datetime(value).date()
+
+
+def as_time(value, fallback: dtime | None = None) -> dtime:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return fallback or dtime(9, 0)
+    if isinstance(value, dtime):
+        return value.replace(second=0, microsecond=0)
+    if isinstance(value, datetime):
+        return value.time().replace(second=0, microsecond=0)
+    ts = pd.to_datetime(value)
+    return ts.to_pydatetime().time().replace(second=0, microsecond=0)
+
+
 def money(v) -> float:
     """Treat empty number inputs as 0."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -606,73 +627,139 @@ with tab_event:
         if roster_df.empty:
             st.warning("Roster is empty — use quick-add above, or the Staff Roster tab.")
         else:
-            # Prefill times from last event defaults when available
+            # Staff + times outside the form so suggested pay updates live
             dflt = st.session_state.last_event_defaults or {}
-            with st.form("inline_staff_shift_form", clear_on_submit=True, border=False):
-                r1, r2 = st.columns([1.4, 1.6])
-                with r1:
-                    staff_choice = st.selectbox(
-                        "Staff *",
-                        options=list(roster_df["id"]),
-                        format_func=lambda sid: roster_df[roster_df["id"] == sid].iloc[0][
-                            "name"
-                        ],
+            ev_row = events_df[events_df["id"] == event_choice].iloc[0]
+            # When the picked event changes, load that event's start/end into the shift times
+            if st.session_state.get("inline_shift_event_bound") != int(event_choice):
+                if ev_row.get("start_at") is not None and not pd.isna(ev_row.get("start_at")):
+                    st.session_state.inline_shift_start_d = as_date(ev_row["start_at"])
+                    st.session_state.inline_shift_start_t = as_time(
+                        ev_row["start_at"], dtime(9, 0)
                     )
-                with r2:
-                    selected_rate = roster_df[roster_df["id"] == staff_choice].iloc[0][
-                        "default_pay_rate"
-                    ]
-                    st.caption(
-                        f"Default rate: "
-                        f"${float(selected_rate):.2f}/hr"
-                        if selected_rate
-                        else "No default rate"
+                else:
+                    st.session_state.inline_shift_start_d = dflt.get(
+                        "start_d", date.today()
                     )
-
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    shift_start_d = st.date_input(
-                        "Start date *",
-                        value=dflt.get("start_d", date.today()),
-                        format=DATE_FMT,
-                        key="inline_shift_start_d",
+                    st.session_state.inline_shift_start_t = dflt.get(
+                        "start_t", dtime(9, 0)
                     )
-                with c2:
-                    shift_start_t = st.time_input(
-                        "Start *",
-                        value=dflt.get("start_t", dtime(9, 0)),
-                        key="inline_shift_start_t",
+                if ev_row.get("end_at") is not None and not pd.isna(ev_row.get("end_at")):
+                    st.session_state.inline_shift_end_d = as_date(ev_row["end_at"])
+                    st.session_state.inline_shift_end_t = as_time(
+                        ev_row["end_at"], dtime(17, 0)
                     )
-                with c3:
-                    shift_end_d = st.date_input(
-                        "End date *",
-                        value=dflt.get("end_d", dflt.get("start_d", date.today())),
-                        format=DATE_FMT,
-                        key="inline_shift_end_d",
-                        help="Defaults to the event start/end; change only if needed.",
+                else:
+                    st.session_state.inline_shift_end_d = dflt.get(
+                        "end_d", st.session_state.inline_shift_start_d
                     )
-                with c4:
-                    shift_end_t = st.time_input(
-                        "End *",
-                        value=dflt.get("end_t", dtime(17, 0)),
-                        key="inline_shift_end_t",
+                    st.session_state.inline_shift_end_t = dflt.get(
+                        "end_t", dtime(17, 0)
                     )
-
-                shift_start = combine_dt(shift_start_d, shift_start_t)
-                shift_end = combine_dt(shift_end_d, shift_end_t)
-                hours_preview = max(
-                    (shift_end - shift_start).total_seconds() / 3600.0, 0
+                st.session_state.inline_shift_prev_start_d = (
+                    st.session_state.inline_shift_start_d
                 )
-                if selected_rate and hours_preview > 0:
-                    st.caption(
-                        f"Suggested ${hours_preview * float(selected_rate):.2f} "
-                        f"({hours_preview:.1f}h)"
-                    )
+                st.session_state.inline_shift_event_bound = int(event_choice)
 
+            if "inline_shift_start_d" not in st.session_state:
+                st.session_state.inline_shift_start_d = dflt.get("start_d", date.today())
+            if "inline_shift_end_d" not in st.session_state:
+                st.session_state.inline_shift_end_d = dflt.get(
+                    "end_d", st.session_state.inline_shift_start_d
+                )
+            if "inline_shift_prev_start_d" not in st.session_state:
+                st.session_state.inline_shift_prev_start_d = (
+                    st.session_state.inline_shift_start_d
+                )
+            if "inline_shift_start_t" not in st.session_state:
+                st.session_state.inline_shift_start_t = dflt.get("start_t", dtime(9, 0))
+            if "inline_shift_end_t" not in st.session_state:
+                st.session_state.inline_shift_end_t = dflt.get("end_t", dtime(17, 0))
+
+            if (
+                st.session_state.inline_shift_start_d
+                != st.session_state.inline_shift_prev_start_d
+            ):
+                if (
+                    st.session_state.inline_shift_end_d
+                    == st.session_state.inline_shift_prev_start_d
+                ):
+                    st.session_state.inline_shift_end_d = (
+                        st.session_state.inline_shift_start_d
+                    )
+                st.session_state.inline_shift_prev_start_d = (
+                    st.session_state.inline_shift_start_d
+                )
+
+            staff_choice = st.selectbox(
+                "Staff *",
+                options=list(roster_df["id"]),
+                format_func=lambda sid: roster_df[roster_df["id"] == sid].iloc[0][
+                    "name"
+                ],
+                key="inline_staff_choice",
+            )
+            selected_rate_raw = roster_df[roster_df["id"] == staff_choice].iloc[0][
+                "default_pay_rate"
+            ]
+            selected_rate = (
+                float(selected_rate_raw)
+                if selected_rate_raw is not None
+                and not (isinstance(selected_rate_raw, float) and pd.isna(selected_rate_raw))
+                else None
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                shift_start_d = st.date_input(
+                    "Start date *",
+                    key="inline_shift_start_d",
+                    format=DATE_FMT,
+                )
+            with c2:
+                shift_start_t = st.time_input("Start *", key="inline_shift_start_t")
+            with c3:
+                shift_end_d = st.date_input(
+                    "End date *",
+                    key="inline_shift_end_d",
+                    format=DATE_FMT,
+                )
+            with c4:
+                shift_end_t = st.time_input("End *", key="inline_shift_end_t")
+
+            shift_start = combine_dt(shift_start_d, shift_start_t)
+            shift_end = combine_dt(shift_end_d, shift_end_t)
+            hours_preview = max(
+                (shift_end - shift_start).total_seconds() / 3600.0, 0
+            )
+            suggested_pay = (
+                round(hours_preview * selected_rate, 2)
+                if selected_rate is not None and hours_preview > 0
+                else None
+            )
+            if selected_rate is not None and hours_preview > 0:
+                st.info(
+                    f"Suggested pay: **${suggested_pay:.2f}** "
+                    f"({hours_preview:.1f}h × ${selected_rate:.2f}/hr)"
+                )
+            elif selected_rate is None:
+                st.caption("No hourly rate on this staff — type the amount paid below.")
+            else:
+                st.caption("Set end after start to see suggested pay.")
+
+            with st.form("inline_staff_shift_form", clear_on_submit=True, border=False):
                 p1, p2 = st.columns(2)
                 with p1:
                     amount_paid = st.number_input(
-                        "Amount paid $ *", min_value=0.0, step=1.0, format="%.2f"
+                        "Amount paid $",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f",
+                        value=None,
+                        placeholder=(
+                            f"{suggested_pay:.2f}" if suggested_pay is not None else "0.00"
+                        ),
+                        help="Leave blank to use the suggested pay above.",
                     )
                 with p2:
                     paid = st.radio("Paid?", ["Yes", "No"], horizontal=True)
@@ -685,32 +772,89 @@ with tab_event:
                 if shift_end <= shift_start:
                     st.error("End must be after start.")
                 else:
-                    run_write(
-                        """
-                        insert into staff_shifts
-                            (event_id, staff_id, start_at, end_at, amount_paid, paid)
-                        values
-                            (:event_id, :staff_id, :start_at, :end_at, :amount_paid, :paid)
-                        """,
-                        {
-                            "event_id": int(event_choice),
-                            "staff_id": int(staff_choice),
-                            "start_at": shift_start,
-                            "end_at": shift_end,
-                            "amount_paid": amount_paid,
-                            "paid": paid == "Yes",
-                        },
+                    pay_amount = (
+                        money(amount_paid)
+                        if amount_paid is not None
+                        else suggested_pay
                     )
-                    if int(event_choice) == st.session_state.last_event_id:
-                        st.session_state.shifts_saved_for_event += 1
+                    if pay_amount is None:
+                        st.error(
+                            "Enter amount paid, or set an hourly rate on this staff member."
+                        )
                     else:
-                        st.session_state.last_event_id = int(event_choice)
-                        st.session_state.shifts_saved_for_event = 1
-                    staff_name = roster_df[roster_df["id"] == staff_choice].iloc[0]["name"]
-                    st.success(
-                        f"Added {staff_name} to EVT-{int(event_choice):04d}. "
-                        "Add another, or fill the next event above."
+                        run_write(
+                            """
+                            insert into staff_shifts
+                                (event_id, staff_id, start_at, end_at, amount_paid, paid)
+                            values
+                                (:event_id, :staff_id, :start_at, :end_at, :amount_paid, :paid)
+                            """,
+                            {
+                                "event_id": int(event_choice),
+                                "staff_id": int(staff_choice),
+                                "start_at": shift_start,
+                                "end_at": shift_end,
+                                "amount_paid": pay_amount,
+                                "paid": paid == "Yes",
+                            },
+                        )
+                        if int(event_choice) == st.session_state.last_event_id:
+                            st.session_state.shifts_saved_for_event += 1
+                        else:
+                            st.session_state.last_event_id = int(event_choice)
+                            st.session_state.shifts_saved_for_event = 1
+                        staff_name = roster_df[
+                            roster_df["id"] == staff_choice
+                        ].iloc[0]["name"]
+                        st.success(
+                            f"Added {staff_name} — ${pay_amount:.2f} on "
+                            f"EVT-{int(event_choice):04d}."
+                        )
+                        st.rerun()
+
+            # Shifts already on this event (quick view + delete)
+            event_shifts = fetch_df(
+                """
+                select ss.id, st.name as staff_name, ss.start_at, ss.end_at,
+                       ss.amount_paid, ss.paid
+                from staff_shifts ss
+                left join staff st on st.id = ss.staff_id
+                where ss.event_id = :eid
+                order by ss.start_at nulls last, ss.id
+                """,
+                {"eid": int(event_choice)},
+            )
+            if not event_shifts.empty:
+                st.caption("Shifts on this event")
+                st.dataframe(
+                    event_shifts.pipe(format_df_dates_au),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(160, 40 + 35 * len(event_shifts)),
+                )
+                del_shift_id = st.selectbox(
+                    "Remove a shift from this event",
+                    options=[None] + list(event_shifts["id"]),
+                    format_func=lambda sid: (
+                        "— select —"
+                        if sid is None
+                        else (
+                            f"{event_shifts.loc[event_shifts['id'] == sid, 'staff_name'].iloc[0] or '?'} · "
+                            f"${float(event_shifts.loc[event_shifts['id'] == sid, 'amount_paid'].iloc[0] or 0):.2f}"
+                        )
+                    ),
+                    key="quick_del_shift",
+                )
+                if del_shift_id is not None and st.button(
+                    "Delete selected shift",
+                    key="quick_del_shift_btn",
+                ):
+                    run_write(
+                        "delete from staff_shifts where id = :id",
+                        {"id": int(del_shift_id)},
                     )
+                    st.success("Shift deleted.")
+                    st.rerun()
 
 # === TAB — Staff Roster =====================================================
 with tab_roster:
@@ -909,16 +1053,211 @@ with tab_browse:
                 st.rerun()
 
     st.caption("Staff shifts")
-    shifts_view = fetch_df(
-        "select * from staff_shifts_view "
-        "order by event_date desc nulls last, id desc limit 500"
+    shifts_detail = fetch_df(
+        """
+        select ss.id, ss.event_id, ss.staff_id, e.venue, e.event_date,
+               st.name as staff_name, ss.start_at, ss.end_at,
+               ss.amount_paid, ss.paid
+        from staff_shifts ss
+        join events e on e.id = ss.event_id
+        left join staff st on st.id = ss.staff_id
+        order by coalesce(ss.start_at, e.event_date::timestamptz) desc nulls last, ss.id desc
+        limit 500
+        """
     )
     st.dataframe(
-        shifts_view.pipe(format_df_dates_au),
+        shifts_detail.drop(columns=["staff_id"], errors="ignore").pipe(
+            format_df_dates_au
+        ),
         use_container_width=True,
         hide_index=True,
         height=220,
     )
+
+    if not shifts_detail.empty:
+        roster_for_fix = load_staff_roster()
+
+        def shift_label(sid: int) -> str:
+            r = shifts_detail[shifts_detail["id"] == sid].iloc[0]
+            return (
+                f"#{int(sid)} — {r['staff_name'] or '?'} · "
+                f"EVT-{int(r['event_id']):04d} {r['venue'] or ''} · "
+                f"${float(r['amount_paid'] or 0):.2f}"
+            )
+
+        with st.expander("Fix a staff shift", expanded=False):
+            fix_shift_id = st.selectbox(
+                "Shift",
+                options=list(shifts_detail["id"]),
+                format_func=shift_label,
+                key="fix_shift_id",
+            )
+            srow = shifts_detail[shifts_detail["id"] == fix_shift_id].iloc[0]
+            sid_key = int(fix_shift_id)
+            staff_ids = list(roster_for_fix["id"]) if not roster_for_fix.empty else []
+            cur_staff = (
+                int(srow["staff_id"])
+                if srow["staff_id"] is not None and not pd.isna(srow["staff_id"])
+                else None
+            )
+            staff_index = (
+                staff_ids.index(cur_staff)
+                if cur_staff in staff_ids
+                else 0
+            )
+
+            # Live suggested pay while editing
+            if staff_ids:
+                fs_staff = st.selectbox(
+                    "Staff",
+                    options=staff_ids,
+                    index=staff_index,
+                    format_func=lambda sid: roster_for_fix[
+                        roster_for_fix["id"] == sid
+                    ].iloc[0]["name"],
+                    key=f"fix_shift_staff_{sid_key}",
+                )
+            else:
+                fs_staff = cur_staff
+                st.warning("Roster is empty — can't reassign staff.")
+
+            fs1, fs2, fs3, fs4 = st.columns(4)
+            with fs1:
+                fs_start_d = st.date_input(
+                    "Start date",
+                    value=as_date(srow["start_at"]),
+                    format=DATE_FMT,
+                    key=f"fix_shift_start_d_{sid_key}",
+                )
+            with fs2:
+                fs_start_t = st.time_input(
+                    "Start",
+                    value=as_time(srow["start_at"], dtime(9, 0)),
+                    key=f"fix_shift_start_t_{sid_key}",
+                )
+            with fs3:
+                fs_end_d = st.date_input(
+                    "End date",
+                    value=as_date(srow["end_at"], as_date(srow["start_at"])),
+                    format=DATE_FMT,
+                    key=f"fix_shift_end_d_{sid_key}",
+                )
+            with fs4:
+                fs_end_t = st.time_input(
+                    "End",
+                    value=as_time(srow["end_at"], dtime(17, 0)),
+                    key=f"fix_shift_end_t_{sid_key}",
+                )
+
+            fs_start = combine_dt(fs_start_d, fs_start_t)
+            fs_end = combine_dt(fs_end_d, fs_end_t)
+            fs_hours = max((fs_end - fs_start).total_seconds() / 3600.0, 0)
+            fs_rate = None
+            if fs_staff is not None and not roster_for_fix.empty:
+                rate_raw = roster_for_fix[
+                    roster_for_fix["id"] == fs_staff
+                ].iloc[0]["default_pay_rate"]
+                if rate_raw is not None and not (
+                    isinstance(rate_raw, float) and pd.isna(rate_raw)
+                ):
+                    fs_rate = float(rate_raw)
+            fs_suggested = (
+                round(fs_hours * fs_rate, 2)
+                if fs_rate is not None and fs_hours > 0
+                else None
+            )
+            if fs_suggested is not None:
+                st.caption(
+                    f"Suggested from rate: ${fs_suggested:.2f} "
+                    f"({fs_hours:.1f}h × ${fs_rate:.2f}/hr)"
+                )
+
+            with st.form(f"fix_shift_form_{sid_key}", border=False):
+                fp1, fp2 = st.columns(2)
+                with fp1:
+                    fs_amount = st.number_input(
+                        "Amount paid $",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f",
+                        value=float(srow["amount_paid"] or 0),
+                    )
+                with fp2:
+                    fs_paid = st.radio(
+                        "Paid?",
+                        ["Yes", "No"],
+                        horizontal=True,
+                        index=0 if bool(srow["paid"]) else 1,
+                    )
+                use_suggested = st.form_submit_button(
+                    "Save with suggested pay",
+                    disabled=fs_suggested is None,
+                    use_container_width=True,
+                )
+                fix_shift_submit = st.form_submit_button(
+                    "Save corrections", type="primary", use_container_width=True
+                )
+
+            if use_suggested or fix_shift_submit:
+                if fs_end <= fs_start:
+                    st.error("End must be after start.")
+                elif fs_staff is None:
+                    st.error("Staff is required.")
+                else:
+                    pay_out = (
+                        fs_suggested
+                        if use_suggested and fs_suggested is not None
+                        else fs_amount
+                    )
+                    run_write(
+                        """
+                        update staff_shifts set
+                            staff_id = :staff_id,
+                            start_at = :start_at,
+                            end_at = :end_at,
+                            amount_paid = :amount_paid,
+                            paid = :paid
+                        where id = :id
+                        """,
+                        {
+                            "id": int(fix_shift_id),
+                            "staff_id": int(fs_staff),
+                            "start_at": fs_start,
+                            "end_at": fs_end,
+                            "amount_paid": pay_out,
+                            "paid": fs_paid == "Yes",
+                        },
+                    )
+                    st.success(f"Updated shift #{int(fix_shift_id)}.")
+                    st.rerun()
+
+        with st.expander("Delete a staff shift", expanded=False):
+            del_shift = st.selectbox(
+                "Shift to delete",
+                options=list(shifts_detail["id"]),
+                format_func=shift_label,
+                key="delete_shift_id",
+            )
+            st.warning(
+                f"This permanently removes **{shift_label(int(del_shift))}**."
+            )
+            del_shift_confirm = st.checkbox(
+                f"I understand — permanently delete shift #{int(del_shift)}",
+                key="delete_shift_confirm",
+            )
+            if st.button(
+                "Delete shift",
+                type="primary",
+                disabled=not del_shift_confirm,
+                use_container_width=True,
+                key="delete_shift_btn",
+            ):
+                run_write(
+                    "delete from staff_shifts where id = :id",
+                    {"id": int(del_shift)},
+                )
+                st.success(f"Deleted shift #{int(del_shift)}.")
+                st.rerun()
 
 # === TAB 5 — Export ===========================================================
 with tab_export:
